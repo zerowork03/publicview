@@ -2,11 +2,11 @@
 # Windows PowerShell 5.1 / PowerShell 7 を想定しています。
 # 最初にこの設定欄を実際の環境に合わせて変更してください。
 $WorkspacePath   = 'C:\AccuRev\workspace'
-$WorkspaceName   = 'WORKSPACE_NAME' # AccuRev 上のワークスペース名。フォルダ名とは限りません
-$DepotName       = 'DEPOT_NAME'
+$StreamName      = 'STREAM_NAME'    # 履歴と課題を調べる対象ストリーム
+$DepotName       = 'DEPOT_NAME'     # 課題 DB の参照先。出力範囲はストリームで絞る
 $UserId          = 'USER_ID'
 $Password        = 'PASSWORD'
-$TargetDepotPath = '/.'           # ワークスペースに対応する Depot 全体。必要なら '/./src' に変更
+$TargetDepotPath = '/.'           # ストリーム内の全ファイル。必要なら '/./src' に絞る
 $StartDate       = ''             # 例: '2024-01-01'。空欄なら全期間
 $EndDate         = ''             # 例: '2024-12-31'。開始日と終了日は両方指定する
 $TitleFieldName  = ''             # 通常は空欄で自動検出。独自項目を使う場合だけ指定
@@ -36,14 +36,25 @@ function Test-TargetPath([string]$Path, [string]$Target) {
 }
 
 function Get-XmlFromAccuRev([string[]]$Arguments, [string]$Purpose) {
-    # コマンド失敗時は中途半端な一覧を作らず停止します。
-    $result = & accurev @Arguments 2>&1
+    # 標準エラーを XML に混ぜず、失敗時は原文を残して原因を確認できるようにします。
+    Write-Host "取得中: $Purpose（AccuRev の応答待ち）"
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $stderrPath = Join-Path $OutputDirectory 'accurev-直近の標準エラー.txt'
+    $result = & accurev @Arguments 2> $stderrPath
+    $stopwatch.Stop()
+    Write-Host ("応答: {0}（{1:N1} 秒）" -f $Purpose, $stopwatch.Elapsed.TotalSeconds)
+    $stderrText = if (Test-Path -LiteralPath $stderrPath) { [System.IO.File]::ReadAllText($stderrPath) } else { '' }
     if ($LASTEXITCODE -ne 0) {
-        throw "$Purpose に失敗しました: $($result -join ' ')"
+        throw "$Purpose に失敗しました（終了コード $LASTEXITCODE）。標準エラー: $stderrPath`n$stderrText"
     }
     $xmlText = $result -join [Environment]::NewLine
     try { return [xml]$xmlText }
-    catch { throw "$Purpose の結果を XML として読み取れませんでした。" }
+    catch {
+        # ログインコマンドはこの関数を通らないため、パスワードは保存しません。
+        $rawPath = Join-Path $OutputDirectory 'accurev-XML読取失敗_原文.txt'
+        [System.IO.File]::WriteAllText($rawPath, $xmlText, $Utf8NoBom)
+        throw "$Purpose の結果を XML として読み取れませんでした。原因: $($_.Exception.Message) 原文: $rawPath 標準エラー: $stderrPath"
+    }
 }
 
 function Save-TabText($Rows, [string]$Path, [string[]]$Headers) {
@@ -61,8 +72,8 @@ function Save-TabText($Rows, [string]$Path, [string[]]$Headers) {
 if (-not (Test-Path -LiteralPath $WorkspacePath -PathType Container)) {
     throw "ワークスペースが見つかりません: $WorkspacePath"
 }
-if ($WorkspaceName -eq 'WORKSPACE_NAME' -or $DepotName -eq 'DEPOT_NAME' -or $UserId -eq 'USER_ID' -or $Password -eq 'PASSWORD') {
-    throw 'ワークスペース名、Depot 名、ユーザー ID、パスワードを設定してください。'
+if ($StreamName -eq 'STREAM_NAME' -or $DepotName -eq 'DEPOT_NAME' -or $UserId -eq 'USER_ID' -or $Password -eq 'PASSWORD') {
+    throw 'ストリーム名、Depot 名、ユーザー ID、パスワードを設定してください。'
 }
 $target = ConvertTo-DepotPath $TargetDepotPath
 if ($target -ne '/.' -and -not $target.StartsWith('/./')) {
@@ -99,10 +110,19 @@ try {
         [void](New-Item -ItemType Directory -Path $OutputDirectory)
     }
 
-    # 履歴は Depot 全体・全期間・全操作・全ストリームから取得します。
-    # 日付範囲は後で一覧に適用するため、移動前後のファイル ID を追跡できます。
-    $historyXml = Get-XmlFromAccuRev @('hist', '-fivx', '--show_historic_cpk', '-a', '-p', $DepotName) '変更履歴の取得'
-    $historyXml.Save((Join-Path $OutputDirectory 'ソース変更履歴_原本.xml'))
+    # -a は Depot 全体を検索して非常に重くなるため使いません。
+    # -s と Depot 相対パス、-R で指定ストリーム/フォルダの履歴を再帰取得します。
+    $histArgs = @('hist', '-fivx', '--show_historic_cpk', '-s', $StreamName, '-p', $DepotName, '-R')
+    if ($fromDate) {
+        # AccuRev 側で日付を絞り、巨大な全期間 XML を作らないようにします。
+        $range = '{0} 23:59:59 - {1} 00:00:00' -f $toDate.ToString('yyyy/MM/dd'), $fromDate.ToString('yyyy/MM/dd')
+        $histArgs += @('-t', $range)
+    } else {
+        Write-Warning '日付が未指定です。指定ストリームの全期間履歴を取得するため、非常に長時間かかる場合があります。'
+    }
+    $histArgs += $target
+    $historyXml = Get-XmlFromAccuRev $histArgs 'ストリーム変更履歴の取得'
+    $historyXml.Save((Join-Path $OutputDirectory 'ストリーム変更履歴_原本.xml'))
 
     # 課題番号のフィールド ID は Depot ごとに異なり得るため、スキーマから調べます。
     $schemaXml = Get-XmlFromAccuRev @('getconfig', '-p', $DepotName, '-r', 'schema.xml') '課題スキーマの取得'
@@ -113,20 +133,45 @@ try {
     }
     $issueNumFid = $issueNumField.Attributes['fid'].Value
 
-    # issuelist は変更パッケージを持たない課題を含まないため、queryIssue で全件取得します。
-    $escapedDepot = [Security.SecurityElement]::Escape($DepotName)
-    $queryText = '<queryIssue issueDB="{0}">{1}  {2} &gt;= "0"{1}</queryIssue>' -f $escapedDepot, [Environment]::NewLine, $issueNumFid
-    $queryPath = Join-Path $OutputDirectory '全課題検索.xml'
-    [System.IO.File]::WriteAllText($queryPath, $queryText, $Utf8NoBom)
-    $issuesXml = Get-XmlFromAccuRev @('xml', '-l', $queryPath) '全課題の取得'
-    $issuesXml.Save((Join-Path $OutputDirectory '課題レコード全件.xml'))
-    # AccuRev の版によって <issues> が直下または <acResponse> の下にあります。
-    $issueNodes = @($issuesXml.SelectNodes('//issues/issue'))
-    if ($issueNodes.Count -eq 0) {
-        throw '課題が 0 件でした。検索条件または取得結果を確認してください。'
+    # 現在ストリームに完全/一部含まれる課題を取得します。
+    # -a により現在アクティブではない古い変更パッケージも含めます。
+    $completeXml = Get-XmlFromAccuRev @('issuelist', '-s', $StreamName, '-a', '-fx') 'ストリームの課題（完全）の取得'
+    $partialXml = Get-XmlFromAccuRev @('issuelist', '-s', $StreamName, '-a', '-i', '-fx') 'ストリームの課題（一部）の取得'
+    $completeXml.Save((Join-Path $OutputDirectory 'ストリーム課題_完全_原本.xml'))
+    $partialXml.Save((Join-Path $OutputDirectory 'ストリーム課題_一部_原本.xml'))
+
+    # 現在はストリーム内に無くても、過去の変更履歴に現れる課題を追加します。
+    # Depot の全課題は取得せず、対象ストリームの履歴に現れた番号だけ照会します。
+    $issueByNumber = @{}
+    foreach ($issue in @($completeXml.SelectNodes('//issues/issue')) + @($partialXml.SelectNodes('//issues/issue'))) {
+        $numberNode = $issue.SelectSingleNode('./issueNum')
+        if ($numberNode) { $issueByNumber[$numberNode.InnerText.Trim()] = $issue }
+    }
+    $historicIssueDirectory = Join-Path $OutputDirectory 'ストリーム過去課題_原本'
+    if (-not (Test-Path -LiteralPath $historicIssueDirectory)) {
+        [void](New-Item -ItemType Directory -Path $historicIssueDirectory)
+    }
+    $historicIssueNumbers = @($historyXml.SelectNodes('//transaction//issueNum') | ForEach-Object { $_.InnerText.Trim() } | Where-Object { $_ -match '^\d+$' } | Sort-Object -Unique)
+    foreach ($number in $historicIssueNumbers) {
+        if ($issueByNumber.ContainsKey($number)) { continue }
+        $pastIssueXml = Get-XmlFromAccuRev @('issuelist', '-p', $DepotName, '-I', $number, '-d', '-fx') "過去の課題 $number の取得"
+        $pastIssueXml.Save((Join-Path $historicIssueDirectory "課題_$number.xml"))
+        $pastIssue = $pastIssueXml.SelectSingleNode("//issues/issue[issueNum='$number']")
+        if ($pastIssue) { $issueByNumber[$number] = $pastIssue }
     }
 
-    # 全課題の全フィールドを列にします。標準項目以外も捨てません。
+    # 後続の一覧・課題履歴・変更パッケージはこのストリーム限定の課題集合を使います。
+    $escapedDepot = [Security.SecurityElement]::Escape($DepotName)
+    $issueNodes = @($issueByNumber.Values)
+    $issuesXml = New-Object System.Xml.XmlDocument
+    $issuesRoot = $issuesXml.CreateElement('issues')
+    [void]$issuesXml.AppendChild($issuesRoot)
+    foreach ($issue in $issueNodes) {
+        [void]$issuesRoot.AppendChild($issuesXml.ImportNode($issue, $true))
+    }
+    $issuesXml.Save((Join-Path $OutputDirectory 'ストリーム課題レコード全件.xml'))
+
+    # 対象ストリームに関係する課題の全フィールドを列にします。
     $fieldNames = New-Object 'System.Collections.Generic.List[string]'
     foreach ($issue in $issueNodes) {
         foreach ($field in $issue.ChildNodes) {
@@ -135,7 +180,7 @@ try {
             }
         }
     }
-    # タイトル名は一覧表示用です。全課題・全履歴の取得条件にはしません。
+    # タイトル名は一覧表示用です。履歴の取得条件にはしません。
     $detectedTitleField = $TitleFieldName
     if (-not $detectedTitleField) {
         foreach ($candidate in @('shortDescription', 'title', 'summary')) {
@@ -147,7 +192,7 @@ try {
         $detectedTitleField = ''
     }
     if (-not $detectedTitleField) {
-        Write-Warning '課題タイトル項目を特定できません。課題レコード・履歴は全件保存します。'
+        Write-Warning '課題タイトル項目を特定できません。対象ストリームの課題レコード・履歴は保存します。'
     }
     $headerNames = @{
         issueNum='課題番号'; transNum='課題更新履歴番号'; shortDescription='短い説明'
@@ -182,13 +227,7 @@ try {
     })
     Save-TabText $issueRows (Join-Path $OutputDirectory '課題一覧.txt') $issueHeaders
 
-    # 現在ワークスペースに含まれる課題を取得します。
-    # 完全に含まれる課題と、一部だけ含まれる課題は別の照会になります。
-    # -a を付け、現在アクティブでない古い変更パッケージも含めます。
-    $completeXml = Get-XmlFromAccuRev @('issuelist', '-s', $WorkspaceName, '-a', '-fx') 'ワークスペースの課題（完全）の取得'
-    $partialXml = Get-XmlFromAccuRev @('issuelist', '-s', $WorkspaceName, '-a', '-i', '-fx') 'ワークスペースの課題（一部）の取得'
-    $completeXml.Save((Join-Path $OutputDirectory 'ワークスペース課題_完全_原本.xml'))
-    $partialXml.Save((Join-Path $OutputDirectory 'ワークスペース課題_一部_原本.xml'))
+    # 現在ストリームに完全/一部含まれる課題を一覧にします。
     $workspaceIssueRows = @()
     foreach ($group in @(@{Xml=$completeXml; State='完全'}, @{Xml=$partialXml; State='一部'})) {
         foreach ($issue in $group.Xml.SelectNodes('//issues/issue')) {
@@ -198,15 +237,14 @@ try {
             $workspaceIssueRows += [pscustomobject][ordered]@{
                 '課題番号' = $number
                 '課題タイトル' = if ($issueTitles.ContainsKey($number)) { $issueTitles[$number] } else { '（課題レコード未取得）' }
-                'ワークスペース内の状態' = $group.State
+                'ストリーム内の状態' = $group.State
             }
         }
     }
-    $workspaceIssueRows = @($workspaceIssueRows | Sort-Object 課題番号, ワークスペース内の状態 -Unique)
-    Save-TabText $workspaceIssueRows (Join-Path $OutputDirectory 'ワークスペース課題一覧.txt') @('課題番号','課題タイトル','ワークスペース内の状態')
+    $workspaceIssueRows = @($workspaceIssueRows | Sort-Object 課題番号, ストリーム内の状態 -Unique)
+    Save-TabText $workspaceIssueRows (Join-Path $OutputDirectory 'ストリーム課題一覧.txt') @('課題番号','課題タイトル','ストリーム内の状態')
 
-    # queryIssue には課題の Changes 欄が含まれません。
-    # cpkdescribe で全課題の変更パッケージを 50 件ずつ取得し、XML のまま保存します。
+    # cpkdescribe で対象課題の変更パッケージを 50 件ずつ取得し、XML のまま保存します。
     $packageDirectory = Join-Path $OutputDirectory '課題変更パッケージ'
     if (-not (Test-Path -LiteralPath $packageDirectory)) {
         [void](New-Item -ItemType Directory -Path $packageDirectory)
@@ -223,7 +261,7 @@ try {
         $packageXml.Save((Join-Path $packageDirectory $fileName))
     }
 
-    # 課題とファイルとの関連有無に関係なく、全課題の更新履歴を個別に取得します。
+    # 課題とファイルとの関連有無に関係なく、対象課題の更新履歴を個別に取得します。
     # historyIssue の結果は版による差があるため XML のまま保存し、情報を省略しません。
     $issueHistoryDirectory = Join-Path $OutputDirectory '課題更新履歴'
     if (-not (Test-Path -LiteralPath $issueHistoryDirectory)) {
@@ -316,10 +354,10 @@ try {
     $historyRows = @($historyRows | Sort-Object ファイルID, 履歴番号)
     Save-TabText $historyRows (Join-Path $OutputDirectory 'ファイル別変更履歴.txt') $historyHeaders
 
-    # 課題がワークスペースに「ある」ことと、そこから「プロモートされた」ことは別です。
-    # promote トランザクションの送信元が指定ワークスペースのものを抽出します。
+    # 課題がストリームに「ある」ことと、そこへ「プロモートされた」ことは別です。
+    # promote トランザクションの送信先が指定ストリームのものを抽出します。
     $promoteRows = foreach ($tx in $historyXml.SelectNodes('//transaction[@type="promote"]')) {
-        if ($tx.GetAttribute('fromStreamName') -ne $WorkspaceName) { continue }
+        if ($tx.GetAttribute('streamName') -ne $StreamName) { continue }
         $epoch = $tx.GetAttribute('time')
         $localTime = if ($epoch -match '^\d+$') { [DateTimeOffset]::FromUnixTimeSeconds([long]$epoch).ToLocalTime().DateTime } else { $null }
         if ($fromDate -and ($null -eq $localTime -or $localTime.Date -lt $fromDate -or $localTime.Date -gt $toDate)) { continue }
@@ -331,7 +369,7 @@ try {
             [pscustomobject][ordered]@{
                 '日時' = if ($localTime) { $localTime.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
                 '履歴番号' = [long]$tx.GetAttribute('id')
-                '送信元ワークスペース' = $tx.GetAttribute('fromStreamName')
+                '送信元ストリーム' = $tx.GetAttribute('fromStreamName')
                 '送信先ストリーム' = $tx.GetAttribute('streamName')
                 'ファイル名' = $version.GetAttribute('path')
                 'ファイルID' = $version.GetAttribute('eid')
@@ -344,9 +382,9 @@ try {
             }
         }
     }
-    $promoteHeaders = @('日時','履歴番号','送信元ワークスペース','送信先ストリーム','ファイル名','ファイルID','バージョン','実バージョン','課題番号','課題タイトル','ユーザー','コメント')
+    $promoteHeaders = @('日時','履歴番号','送信元ストリーム','送信先ストリーム','ファイル名','ファイルID','バージョン','実バージョン','課題番号','課題タイトル','ユーザー','コメント')
     $promoteRows = @($promoteRows | Sort-Object 履歴番号, ファイル名)
-    Save-TabText $promoteRows (Join-Path $OutputDirectory 'ワークスペースからのプロモート履歴.txt') $promoteHeaders
+    Save-TabText $promoteRows (Join-Path $OutputDirectory 'ストリームへのプロモート履歴.txt') $promoteHeaders
 
     Write-Host "完了: $OutputDirectory"
     Write-Host "ファイル履歴 $($historyRows.Count) 件 / 課題 $($issueNodes.Count) 件 / プロモート $($promoteRows.Count) 件"
