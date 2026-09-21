@@ -1,0 +1,241 @@
+# AccuRev の変更履歴と AccuWork 課題を読み取り専用で出力するスクリプトです。
+# Windows PowerShell 5.1 / PowerShell 7 を想定しています。
+# 最初にこの設定欄を実際の環境に合わせて変更してください。
+$WorkspacePath   = 'C:\AccuRev\workspace'
+$DepotName       = 'DEPOT_NAME'
+$UserId          = 'USER_ID'
+$Password        = 'PASSWORD'
+$TargetDepotPath = '/./src'       # 対象フォルダ。Depot 全体なら '/.'
+$StartDate       = ''             # 例: '2024-01-01'。空欄なら全期間
+$EndDate         = ''             # 例: '2024-12-31'。開始日と終了日は両方指定する
+$TitleFieldName  = 'shortDescription' # 課題タイトルのフィールド名。環境で異なる場合は変更
+$OutputDirectory = Join-Path $PSScriptRoot 'accurev-output'
+
+$ErrorActionPreference = 'Stop'
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+function Pause {
+    # Push-Location の前で実行を一時停止するための関数です。
+    [void](Read-Host '設定を確認しましたか。続行するには Enter キーを押してください')
+}
+
+function ConvertTo-DepotPath([string]$Path) {
+    # AccuRev の \。\ と /./ を同じ形式にそろえます。
+    $value = $Path.Trim().Replace('\', '/')
+    if ($value.StartsWith('./')) { $value = '/' + $value }
+    return $value.TrimEnd('/')
+}
+
+function Test-TargetPath([string]$Path, [string]$Target) {
+    $normalized = ConvertTo-DepotPath $Path
+    if (-not $normalized) { return $false }
+    if ($Target -eq '/.') { return $normalized.StartsWith('/./') -or $normalized -eq '/.' }
+    return $normalized.Equals($Target, [StringComparison]::OrdinalIgnoreCase) -or
+           $normalized.StartsWith($Target + '/', [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-XmlFromAccuRev([string[]]$Arguments, [string]$Purpose) {
+    # コマンド失敗時は中途半端な一覧を作らず停止します。
+    $result = & accurev @Arguments 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Purpose に失敗しました: $($result -join ' ')"
+    }
+    $xmlText = $result -join [Environment]::NewLine
+    try { return [xml]$xmlText }
+    catch { throw "$Purpose の結果を XML として読み取れませんでした。" }
+}
+
+function Save-TabText($Rows, [string]$Path, [string[]]$Headers) {
+    # 拡張子は .txt ですが、Excel でも開けるタブ区切り形式です。
+    $items = @($Rows)
+    if ($items.Count -eq 0) {
+        [System.IO.File]::WriteAllText($Path, ($Headers -join "`t") + [Environment]::NewLine, $Utf8NoBom)
+    } else {
+        $items | Select-Object -Property $Headers |
+            Export-Csv -LiteralPath $Path -Delimiter "`t" -NoTypeInformation -Encoding UTF8
+    }
+}
+
+# 設定ミスがあれば、ログイン前に止めます。
+if (-not (Test-Path -LiteralPath $WorkspacePath -PathType Container)) {
+    throw "ワークスペースが見つかりません: $WorkspacePath"
+}
+if ($DepotName -eq 'DEPOT_NAME' -or $UserId -eq 'USER_ID' -or $Password -eq 'PASSWORD') {
+    throw 'Depot 名、ユーザー ID、パスワードを設定してください。'
+}
+$target = ConvertTo-DepotPath $TargetDepotPath
+if ($target -ne '/.' -and -not $target.StartsWith('/./')) {
+    throw "対象フォルダは /./src のような Depot 相対パスで指定してください: $TargetDepotPath"
+}
+if ([bool]$StartDate -ne [bool]$EndDate) {
+    throw '日付範囲を使う場合、開始日と終了日の両方を指定してください。'
+}
+$fromDate = $null
+$toDate = $null
+if ($StartDate) {
+    $culture = [Globalization.CultureInfo]::InvariantCulture
+    $style = [Globalization.DateTimeStyles]::None
+    try {
+        $fromDate = [datetime]::ParseExact($StartDate, 'yyyy-MM-dd', $culture, $style).Date
+        $toDate = [datetime]::ParseExact($EndDate, 'yyyy-MM-dd', $culture, $style).Date
+    } catch {
+        throw '日付は yyyy-MM-dd 形式で指定してください。例: 2024-01-31'
+    }
+    if ($fromDate -gt $toDate) { throw '開始日が終了日より後です。' }
+}
+
+# 要望どおり Push-Location の直前で一時停止します。
+Pause
+Push-Location -LiteralPath $WorkspacePath
+try {
+    # パスワードが違うなどログインに失敗した場合、以降の取得処理には進みません。
+    $loginResult = & accurev login $UserId $Password 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw 'AccuRev ログインに失敗しました。ユーザー ID、パスワード、接続先を確認してください。'
+    }
+
+    if (-not (Test-Path -LiteralPath $OutputDirectory)) {
+        [void](New-Item -ItemType Directory -Path $OutputDirectory)
+    }
+
+    # 履歴は Depot 全体・全期間・全操作・全ストリームから取得します。
+    # 日付範囲は後で一覧に適用するため、移動前後のファイル ID を追跡できます。
+    $historyXml = Get-XmlFromAccuRev @('hist', '-fivx', '--show_historic_cpk', '-a', '-p', $DepotName) '変更履歴の取得'
+    $historyXml.Save((Join-Path $OutputDirectory 'ソース変更履歴_原本.xml'))
+
+    # 課題番号のフィールド ID は Depot ごとに異なり得るため、スキーマから調べます。
+    $schemaXml = Get-XmlFromAccuRev @('getconfig', '-p', $DepotName, '-r', 'schema.xml') '課題スキーマの取得'
+    $schemaXml.Save((Join-Path $OutputDirectory '課題スキーマ.xml'))
+    $issueNumField = $schemaXml.SelectSingleNode("//*[@name='issueNum']")
+    if ($null -eq $issueNumField -or -not $issueNumField.Attributes['fid']) {
+        throw 'スキーマから issueNum のフィールド ID を取得できませんでした。'
+    }
+    $issueNumFid = $issueNumField.Attributes['fid'].Value
+
+    # issuelist は変更パッケージを持たない課題を含まないため、queryIssue で全件取得します。
+    $escapedDepot = [Security.SecurityElement]::Escape($DepotName)
+    $queryText = '<queryIssue issueDB="{0}">{1}  {2} &gt;= "0"{1}</queryIssue>' -f $escapedDepot, [Environment]::NewLine, $issueNumFid
+    $queryPath = Join-Path $OutputDirectory '全課題検索.xml'
+    [System.IO.File]::WriteAllText($queryPath, $queryText, $Utf8NoBom)
+    $issuesXml = Get-XmlFromAccuRev @('xml', '-l', $queryPath) '全課題の取得'
+    $issuesXml.Save((Join-Path $OutputDirectory '課題レコード全件.xml'))
+    $issueNodes = @($issuesXml.SelectNodes('/issues/issue'))
+    if ($issueNodes.Count -eq 0) {
+        throw '課題が 0 件でした。検索条件または取得結果を確認してください。'
+    }
+
+    # 全課題の全フィールドを列にします。標準項目以外も捨てません。
+    $fieldNames = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($issue in $issueNodes) {
+        foreach ($field in $issue.ChildNodes) {
+            if ($field.NodeType -eq [Xml.XmlNodeType]::Element -and -not $fieldNames.Contains($field.Name)) {
+                $fieldNames.Add($field.Name)
+            }
+        }
+    }
+    $headerNames = @{
+        issueNum='課題番号'; transNum='課題更新履歴番号'; shortDescription='課題タイトル'
+        status='状態'; state='進行状態'; priority='優先度'; severity='重大度'
+        type='種別'; submittedBy='起票者'; dateSubmitted='起票日'; assignedTo='担当者'
+        description='説明'; productType='製品種別'; platform='プラットフォーム'
+    }
+    $issueTitles = @{}
+    $issueRows = foreach ($issue in $issueNodes) {
+        $record = [ordered]@{}
+        foreach ($fieldName in $fieldNames) {
+            $heading = if ($headerNames.ContainsKey($fieldName)) { $headerNames[$fieldName] }
+                       else { "課題項目（$fieldName）" }
+            $node = $issue.SelectSingleNode("./$fieldName")
+            $record[$heading] = if ($node) { $node.InnerText } else { '' }
+        }
+        $numberNode = $issue.SelectSingleNode('./issueNum')
+        $titleNode = $issue.SelectSingleNode("./$TitleFieldName")
+        if ($numberNode) { $issueTitles[$numberNode.InnerText.Trim()] = if ($titleNode) { $titleNode.InnerText } else { '' } }
+        [pscustomobject]$record
+    }
+    $issueHeaders = @($fieldNames | ForEach-Object {
+        if ($headerNames.ContainsKey($_)) { $headerNames[$_] } else { "課題項目（$_）" }
+    })
+    Save-TabText $issueRows (Join-Path $OutputDirectory '課題一覧.txt') $issueHeaders
+
+    # queryIssue には課題の Changes 欄が含まれません。
+    # cpkdescribe で全課題の変更パッケージを 50 件ずつ取得し、XML のまま保存します。
+    $packageDirectory = Join-Path $OutputDirectory '課題変更パッケージ'
+    if (-not (Test-Path -LiteralPath $packageDirectory)) {
+        [void](New-Item -ItemType Directory -Path $packageDirectory)
+    }
+    $allIssueNumbers = @($issueNodes | ForEach-Object {
+        $numberNode = $_.SelectSingleNode('./issueNum')
+        if ($numberNode) { $numberNode.InnerText.Trim() }
+    } | Where-Object { $_ })
+    for ($index = 0; $index -lt $allIssueNumbers.Count; $index += 50) {
+        $last = [Math]::Min($index + 49, $allIssueNumbers.Count - 1)
+        $batch = @($allIssueNumbers[$index..$last]) -join ' '
+        $packageXml = Get-XmlFromAccuRev @('cpkdescribe', '-I', $batch, '-p', $DepotName, '-fx') '課題変更パッケージの取得'
+        $fileName = '課題変更パッケージ_{0:D4}.xml' -f ([int]($index / 50) + 1)
+        $packageXml.Save((Join-Path $packageDirectory $fileName))
+    }
+
+    # 履歴をファイル ID 単位でまとめます。移動前後で名前が変わっても同じファイルとして扱います。
+    $events = foreach ($tx in $historyXml.SelectNodes('//transaction[version]')) {
+        foreach ($version in $tx.SelectNodes('./version')) {
+            if ($version.GetAttribute('dir') -eq 'yes' -or $version.GetAttribute('elem_type') -eq 'dir') { continue }
+            $eid = $version.GetAttribute('eid')
+            if (-not $eid -and $tx.ParentNode.Name -eq 'element') { $eid = $tx.ParentNode.GetAttribute('id') }
+            $path = $version.GetAttribute('path')
+            if (-not $path -and $tx.ParentNode.Name -eq 'element') { $path = $tx.ParentNode.GetAttribute('name') }
+            $move = $version.SelectSingleNode('./move')
+            $paths = @($path)
+            if ($move) { $paths += @($move.GetAttribute('source'), $move.GetAttribute('dest')) }
+            $isTarget = @($paths | Where-Object { Test-TargetPath $_ $target }).Count -gt 0
+            $commentNode = $tx.SelectSingleNode('./comment')
+            $issueNumbers = @($version.SelectNodes('./issueNum') | ForEach-Object { $_.InnerText.Trim() } | Where-Object { $_ })
+            $epoch = $tx.GetAttribute('time')
+            $localTime = if ($epoch -match '^\d+$') { [DateTimeOffset]::FromUnixTimeSeconds([long]$epoch).ToLocalTime().DateTime } else { $null }
+            [pscustomobject]@{
+                EID=$eid; Path=$path; InTarget=$isTarget; Time=$localTime
+                Transaction=[long]$tx.GetAttribute('id'); Action=$tx.GetAttribute('type')
+                User=$tx.GetAttribute('user'); Version=$version.GetAttribute('virtual')
+                RealVersion=$version.GetAttribute('real'); Issues=$issueNumbers
+                Comment=if ($commentNode) { $commentNode.InnerText } else { '' }
+            }
+        }
+    }
+    $targetIds = @{}
+    foreach ($event in $events) {
+        if ($event.InTarget -and $event.EID) { $targetIds[$event.EID] = $true }
+    }
+    if (@($events).Count -gt 0 -and @($events | Where-Object { $_.InTarget }).Count -eq 0) {
+        throw "対象フォルダに一致する履歴がありません。TargetDepotPath を確認してください: $TargetDepotPath"
+    }
+
+    $historyRows = foreach ($event in $events) {
+        if (-not ($event.InTarget -or ($event.EID -and $targetIds.ContainsKey($event.EID)))) { continue }
+        if ($fromDate -and ($null -eq $event.Time -or $event.Time.Date -lt $fromDate -or $event.Time.Date -gt $toDate)) { continue }
+        $titles = @($event.Issues | ForEach-Object {
+            if ($issueTitles.ContainsKey($_)) { $issueTitles[$_] } else { '' }
+        })
+        [pscustomobject][ordered]@{
+            'ファイル名'   = $event.Path
+            'ファイルID'   = $event.EID
+            '日時'         = if ($event.Time) { $event.Time.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
+            '操作'         = $event.Action
+            'ユーザー'     = $event.User
+            'バージョン'   = $event.Version
+            '実バージョン' = $event.RealVersion
+            '課題番号'     = $event.Issues -join ', '
+            '課題タイトル' = $titles -join ' / '
+            'コメント'     = $event.Comment
+            '履歴番号'     = $event.Transaction
+        }
+    }
+    $historyHeaders = @('ファイル名','ファイルID','日時','操作','ユーザー','バージョン','実バージョン','課題番号','課題タイトル','コメント','履歴番号')
+    $historyRows = @($historyRows | Sort-Object ファイルID, 履歴番号)
+    Save-TabText $historyRows (Join-Path $OutputDirectory 'ファイル別変更履歴.txt') $historyHeaders
+
+    Write-Host "完了: $OutputDirectory"
+    Write-Host "ファイル履歴 $($historyRows.Count) 件 / 課題 $($issueNodes.Count) 件"
+}
+finally {
+    Pop-Location
+}
