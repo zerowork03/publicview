@@ -1,52 +1,34 @@
-# ステップ1: 指定ストリーム・フォルダの短い期間の履歴を、そのまま保存します。
-# 課題の収集や一覧への加工は、この結果を確認してから行います。
-$AccuRevExe   = 'accurev.exe'           # PATH に無い場合は実行ファイルのフルパス
-$Workspace    = 'C:\AccuRev\workspace' # ワークスペースのフォルダ
-$Stream       = 'STREAM_NAME'           # 調べたいストリーム
-$Depot        = 'DEPOT_NAME'            # そのストリームが属するデポ
-$Folder       = '/./src'                # デポ相対パス。全体なら '/./'
-$UserId       = 'USER_ID'
-$Password     = 'PASSWORD'
-$StartDate    = '2024-01-01'
-$EndDate      = '2024-01-31'
-$OutputFolder = Join-Path $PSScriptRoot 'accurev-step1-output'
+# 1か月以内の履歴を取得し、AccuRev の返答をそのまま保存する確認用です。
+$AccuRevExe = 'accurev.exe'         # 必要ならフルパス
+$Workspace  = 'C:\AccuRev\workspace'
+$Stream     = 'STREAM_NAME'
+$Depot      = 'DEPOT_NAME'
+$Folder     = '/./src'              # 全フォルダなら '/./'
+$UserId     = 'USER_ID'
+$Password   = 'PASSWORD'
+$StartDate  = '2024-01-01'
+$EndDate    = '2024-01-31'
+$SaveTo     = Join-Path $PSScriptRoot 'accurev-history-response.txt'
 
 $ErrorActionPreference = 'Stop'
-if (-not (Test-Path -LiteralPath $Workspace -PathType Container)) {
-    throw "ワークスペースのフォルダがありません: $Workspace"
-}
-if (-not (Get-Command $AccuRevExe -ErrorAction SilentlyContinue)) {
-    throw "AccuRev の実行ファイルが見つかりません: $AccuRevExe"
-}
-$start = [datetime]::ParseExact($StartDate, 'yyyy-MM-dd', [cultureinfo]::InvariantCulture)
-$end = [datetime]::ParseExact($EndDate, 'yyyy-MM-dd', [cultureinfo]::InvariantCulture)
-if ($end -lt $start -or ($end - $start).TotalDays -gt 31) {
-    throw '最初の確認では、開始日から終了日までを31日以内にしてください。'
-}
-[void](New-Item -ItemType Directory -Path $OutputFolder -Force)
-$responseFile = Join-Path $OutputFolder '履歴の返答.txt'
-$errorFile = Join-Path $OutputFolder '標準エラー.txt'
-$timeRange = '{0} 23:59:59 - {1} 00:00:00' -f $end.ToString('yyyy/MM/dd'), $start.ToString('yyyy/MM/dd')
+if (-not (Test-Path -LiteralPath $Workspace -PathType Container)) { throw "フォルダがありません: $Workspace" }
+$first = [datetime]::ParseExact($StartDate, 'yyyy-MM-dd', [cultureinfo]::InvariantCulture)
+$last  = [datetime]::ParseExact($EndDate, 'yyyy-MM-dd', [cultureinfo]::InvariantCulture)
+if ($last -lt $first -or ($last - $first).TotalDays -gt 31) { throw '期間は31日以内にしてください。' }
+$range = '{0} 23:59:59 - {1} 00:00:00' -f $last.ToString('yyyy/MM/dd'), $first.ToString('yyyy/MM/dd')
 
-# 指定どおり、フォルダ移動の直前で一時停止します。
+# 指定どおり、Push-Location の直前で止めます。
 Read-Host '設定を確認したら Enter キーを押してください'
 Push-Location -LiteralPath $Workspace
 try {
-    # パスワードが違う場合はここで止めます。
-    & $AccuRevExe login $UserId $Password 2> $errorFile | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "ログインに失敗しました。ユーザー ID・パスワードを確認してください。詳細: $errorFile"
-    }
+    & $AccuRevExe login $UserId $Password
+    if ($LASTEXITCODE -ne 0) { throw 'ログインに失敗しました。ユーザー ID とパスワードを確認してください。' }
 
-    # まずは加工せず、AccuRev から返った内容を保存します。
-    $commandArgs = @('hist', '-s', $Stream, '-p', $Depot, '-t', $timeRange, '-fx', '-R', $Folder)
-    Write-Host "履歴を取得中: $Stream / $Folder / $StartDate ～ $EndDate"
-    $response = & $AccuRevExe @commandArgs 2> $errorFile
-    [System.IO.File]::WriteAllLines($responseFile, [string[]]$response, [System.Text.UTF8Encoding]::new($false))
-    if ($LASTEXITCODE -ne 0) {
-        throw "履歴の取得に失敗しました。返答: $responseFile 詳細: $errorFile"
-    }
-    Write-Host "取得した返答: $responseFile"
+    # 引数を直接書きます。XML として読み取る処理はまだ行いません。
+    Write-Host "履歴取得中: $Stream / $Folder / $StartDate ～ $EndDate"
+    & $AccuRevExe hist -s $Stream -p $Depot -t $range -fx -R $Folder > $SaveTo
+    if ($LASTEXITCODE -ne 0) { throw "履歴取得に失敗しました。AccuRev の表示と $SaveTo を確認してください。" }
+    Write-Host "保存しました: $SaveTo"
 } finally {
     Pop-Location
 }
