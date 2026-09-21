@@ -2,13 +2,14 @@
 # Windows PowerShell 5.1 / PowerShell 7 を想定しています。
 # 最初にこの設定欄を実際の環境に合わせて変更してください。
 $WorkspacePath   = 'C:\AccuRev\workspace'
+$WorkspaceName   = 'WORKSPACE_NAME' # AccuRev 上のワークスペース名。フォルダ名とは限りません
 $DepotName       = 'DEPOT_NAME'
 $UserId          = 'USER_ID'
 $Password        = 'PASSWORD'
-$TargetDepotPath = '/./src'       # 対象フォルダ。Depot 全体なら '/.'
+$TargetDepotPath = '/.'           # ワークスペースに対応する Depot 全体。必要なら '/./src' に変更
 $StartDate       = ''             # 例: '2024-01-01'。空欄なら全期間
 $EndDate         = ''             # 例: '2024-12-31'。開始日と終了日は両方指定する
-$TitleFieldName  = 'shortDescription' # 課題タイトルのフィールド名。環境で異なる場合は変更
+$TitleFieldName  = ''             # 通常は空欄で自動検出。独自項目を使う場合だけ指定
 $OutputDirectory = Join-Path $PSScriptRoot 'accurev-output'
 
 $ErrorActionPreference = 'Stop'
@@ -47,7 +48,7 @@ function Get-XmlFromAccuRev([string[]]$Arguments, [string]$Purpose) {
 
 function Save-TabText($Rows, [string]$Path, [string[]]$Headers) {
     # 拡張子は .txt ですが、Excel でも開けるタブ区切り形式です。
-    $items = @($Rows)
+    $items = @($Rows | Where-Object { $null -ne $_ })
     if ($items.Count -eq 0) {
         [System.IO.File]::WriteAllText($Path, ($Headers -join "`t") + [Environment]::NewLine, $Utf8NoBom)
     } else {
@@ -60,8 +61,8 @@ function Save-TabText($Rows, [string]$Path, [string[]]$Headers) {
 if (-not (Test-Path -LiteralPath $WorkspacePath -PathType Container)) {
     throw "ワークスペースが見つかりません: $WorkspacePath"
 }
-if ($DepotName -eq 'DEPOT_NAME' -or $UserId -eq 'USER_ID' -or $Password -eq 'PASSWORD') {
-    throw 'Depot 名、ユーザー ID、パスワードを設定してください。'
+if ($WorkspaceName -eq 'WORKSPACE_NAME' -or $DepotName -eq 'DEPOT_NAME' -or $UserId -eq 'USER_ID' -or $Password -eq 'PASSWORD') {
+    throw 'ワークスペース名、Depot 名、ユーザー ID、パスワードを設定してください。'
 }
 $target = ConvertTo-DepotPath $TargetDepotPath
 if ($target -ne '/.' -and -not $target.StartsWith('/./')) {
@@ -119,7 +120,8 @@ try {
     [System.IO.File]::WriteAllText($queryPath, $queryText, $Utf8NoBom)
     $issuesXml = Get-XmlFromAccuRev @('xml', '-l', $queryPath) '全課題の取得'
     $issuesXml.Save((Join-Path $OutputDirectory '課題レコード全件.xml'))
-    $issueNodes = @($issuesXml.SelectNodes('/issues/issue'))
+    # AccuRev の版によって <issues> が直下または <acResponse> の下にあります。
+    $issueNodes = @($issuesXml.SelectNodes('//issues/issue'))
     if ($issueNodes.Count -eq 0) {
         throw '課題が 0 件でした。検索条件または取得結果を確認してください。'
     }
@@ -133,12 +135,27 @@ try {
             }
         }
     }
+    # タイトル名は一覧表示用です。全課題・全履歴の取得条件にはしません。
+    $detectedTitleField = $TitleFieldName
+    if (-not $detectedTitleField) {
+        foreach ($candidate in @('shortDescription', 'title', 'summary')) {
+            if ($fieldNames.Contains($candidate)) { $detectedTitleField = $candidate; break }
+        }
+    }
+    if ($detectedTitleField -and -not $fieldNames.Contains($detectedTitleField)) {
+        Write-Warning "指定したタイトル項目 '$detectedTitleField' はありません。全履歴の取得は続けます。"
+        $detectedTitleField = ''
+    }
+    if (-not $detectedTitleField) {
+        Write-Warning '課題タイトル項目を特定できません。課題レコード・履歴は全件保存します。'
+    }
     $headerNames = @{
-        issueNum='課題番号'; transNum='課題更新履歴番号'; shortDescription='課題タイトル'
+        issueNum='課題番号'; transNum='課題更新履歴番号'; shortDescription='短い説明'
         status='状態'; state='進行状態'; priority='優先度'; severity='重大度'
         type='種別'; submittedBy='起票者'; dateSubmitted='起票日'; assignedTo='担当者'
         description='説明'; productType='製品種別'; platform='プラットフォーム'
     }
+    if ($detectedTitleField) { $headerNames[$detectedTitleField] = '課題タイトル' }
     $issueTitles = @{}
     $issueRows = foreach ($issue in $issueNodes) {
         $record = [ordered]@{}
@@ -149,14 +166,44 @@ try {
             $record[$heading] = if ($node) { $node.InnerText } else { '' }
         }
         $numberNode = $issue.SelectSingleNode('./issueNum')
-        $titleNode = $issue.SelectSingleNode("./$TitleFieldName")
-        if ($numberNode) { $issueTitles[$numberNode.InnerText.Trim()] = if ($titleNode) { $titleNode.InnerText } else { '' } }
+        $titleNode = if ($detectedTitleField) { $issue.SelectSingleNode("./$detectedTitleField") } else { $null }
+        if ($numberNode) {
+            $titleValue = if ($titleNode) { $titleNode.InnerText.Trim() } else { '' }
+            if ([string]::IsNullOrWhiteSpace($titleValue)) {
+                $titleValue = if ($detectedTitleField) { '（課題レコード上で空欄）' } else { '（タイトル項目を特定できません）' }
+            }
+            $issueTitles[$numberNode.InnerText.Trim()] = $titleValue
+            if ($detectedTitleField) { $record['課題タイトル'] = $titleValue }
+        }
         [pscustomobject]$record
     }
     $issueHeaders = @($fieldNames | ForEach-Object {
         if ($headerNames.ContainsKey($_)) { $headerNames[$_] } else { "課題項目（$_）" }
     })
     Save-TabText $issueRows (Join-Path $OutputDirectory '課題一覧.txt') $issueHeaders
+
+    # 現在ワークスペースに含まれる課題を取得します。
+    # 完全に含まれる課題と、一部だけ含まれる課題は別の照会になります。
+    # -a を付け、現在アクティブでない古い変更パッケージも含めます。
+    $completeXml = Get-XmlFromAccuRev @('issuelist', '-s', $WorkspaceName, '-a', '-fx') 'ワークスペースの課題（完全）の取得'
+    $partialXml = Get-XmlFromAccuRev @('issuelist', '-s', $WorkspaceName, '-a', '-i', '-fx') 'ワークスペースの課題（一部）の取得'
+    $completeXml.Save((Join-Path $OutputDirectory 'ワークスペース課題_完全_原本.xml'))
+    $partialXml.Save((Join-Path $OutputDirectory 'ワークスペース課題_一部_原本.xml'))
+    $workspaceIssueRows = @()
+    foreach ($group in @(@{Xml=$completeXml; State='完全'}, @{Xml=$partialXml; State='一部'})) {
+        foreach ($issue in $group.Xml.SelectNodes('//issues/issue')) {
+            $numberNode = $issue.SelectSingleNode('./issueNum')
+            if (-not $numberNode) { continue }
+            $number = $numberNode.InnerText.Trim()
+            $workspaceIssueRows += [pscustomobject][ordered]@{
+                '課題番号' = $number
+                '課題タイトル' = if ($issueTitles.ContainsKey($number)) { $issueTitles[$number] } else { '（課題レコード未取得）' }
+                'ワークスペース内の状態' = $group.State
+            }
+        }
+    }
+    $workspaceIssueRows = @($workspaceIssueRows | Sort-Object 課題番号, ワークスペース内の状態 -Unique)
+    Save-TabText $workspaceIssueRows (Join-Path $OutputDirectory 'ワークスペース課題一覧.txt') @('課題番号','課題タイトル','ワークスペース内の状態')
 
     # queryIssue には課題の Changes 欄が含まれません。
     # cpkdescribe で全課題の変更パッケージを 50 件ずつ取得し、XML のまま保存します。
@@ -175,6 +222,42 @@ try {
         $fileName = '課題変更パッケージ_{0:D4}.xml' -f ([int]($index / 50) + 1)
         $packageXml.Save((Join-Path $packageDirectory $fileName))
     }
+
+    # 課題とファイルとの関連有無に関係なく、全課題の更新履歴を個別に取得します。
+    # historyIssue の結果は版による差があるため XML のまま保存し、情報を省略しません。
+    $issueHistoryDirectory = Join-Path $OutputDirectory '課題更新履歴'
+    if (-not (Test-Path -LiteralPath $issueHistoryDirectory)) {
+        [void](New-Item -ItemType Directory -Path $issueHistoryDirectory)
+    }
+    $historyQueryPath = Join-Path $OutputDirectory '課題履歴検索.xml'
+    foreach ($number in $allIssueNumbers) {
+        $historyQuery = '<historyIssue issueDB="{0}"><issueNum fid="{1}">{2}</issueNum></historyIssue>' -f $escapedDepot, $issueNumFid, $number
+        [System.IO.File]::WriteAllText($historyQueryPath, $historyQuery, $Utf8NoBom)
+        $oneIssueHistory = Get-XmlFromAccuRev @('xml', '-l', $historyQueryPath) "課題 $number の更新履歴取得"
+        $oneIssueHistory.Save((Join-Path $issueHistoryDirectory ("課題_{0}.xml" -f $number)))
+    }
+
+    # ファイル版のない AccuWork 更新 (dispatch) 等も含め、全トランザクションを一覧にします。
+    $transactionRows = foreach ($tx in $historyXml.SelectNodes('//transaction')) {
+        $epoch = $tx.GetAttribute('time')
+        $localTime = if ($epoch -match '^\d+$') { [DateTimeOffset]::FromUnixTimeSeconds([long]$epoch).ToLocalTime().DateTime } else { $null }
+        if ($fromDate -and ($null -eq $localTime -or $localTime.Date -lt $fromDate -or $localTime.Date -gt $toDate)) { continue }
+        $commentNode = $tx.SelectSingleNode('./comment')
+        $numbers = @($tx.SelectNodes('.//issueNum') | ForEach-Object { $_.InnerText.Trim() } | Where-Object { $_ } | Sort-Object -Unique)
+        [pscustomobject][ordered]@{
+            '履歴番号' = [long]$tx.GetAttribute('id')
+            '日時' = if ($localTime) { $localTime.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
+            '操作' = $tx.GetAttribute('type')
+            'ユーザー' = $tx.GetAttribute('user')
+            '送信元ストリーム' = $tx.GetAttribute('fromStreamName')
+            '送信先ストリーム' = $tx.GetAttribute('streamName')
+            '課題番号' = $numbers -join ', '
+            'コメント' = if ($commentNode) { $commentNode.InnerText } else { '' }
+        }
+    }
+    $transactionHeaders = @('履歴番号','日時','操作','ユーザー','送信元ストリーム','送信先ストリーム','課題番号','コメント')
+    $transactionRows = @($transactionRows | Sort-Object 履歴番号)
+    Save-TabText $transactionRows (Join-Path $OutputDirectory '全トランザクション履歴.txt') $transactionHeaders
 
     # 履歴をファイル ID 単位でまとめます。移動前後で名前が変わっても同じファイルとして扱います。
     $events = foreach ($tx in $historyXml.SelectNodes('//transaction[version]')) {
@@ -213,7 +296,7 @@ try {
         if (-not ($event.InTarget -or ($event.EID -and $targetIds.ContainsKey($event.EID)))) { continue }
         if ($fromDate -and ($null -eq $event.Time -or $event.Time.Date -lt $fromDate -or $event.Time.Date -gt $toDate)) { continue }
         $titles = @($event.Issues | ForEach-Object {
-            if ($issueTitles.ContainsKey($_)) { $issueTitles[$_] } else { '' }
+            if ($issueTitles.ContainsKey($_)) { $issueTitles[$_] } else { '（課題レコード未取得）' }
         })
         [pscustomobject][ordered]@{
             'ファイル名'   = $event.Path
@@ -233,8 +316,40 @@ try {
     $historyRows = @($historyRows | Sort-Object ファイルID, 履歴番号)
     Save-TabText $historyRows (Join-Path $OutputDirectory 'ファイル別変更履歴.txt') $historyHeaders
 
+    # 課題がワークスペースに「ある」ことと、そこから「プロモートされた」ことは別です。
+    # promote トランザクションの送信元が指定ワークスペースのものを抽出します。
+    $promoteRows = foreach ($tx in $historyXml.SelectNodes('//transaction[@type="promote"]')) {
+        if ($tx.GetAttribute('fromStreamName') -ne $WorkspaceName) { continue }
+        $epoch = $tx.GetAttribute('time')
+        $localTime = if ($epoch -match '^\d+$') { [DateTimeOffset]::FromUnixTimeSeconds([long]$epoch).ToLocalTime().DateTime } else { $null }
+        if ($fromDate -and ($null -eq $localTime -or $localTime.Date -lt $fromDate -or $localTime.Date -gt $toDate)) { continue }
+        $commentNode = $tx.SelectSingleNode('./comment')
+        foreach ($version in $tx.SelectNodes('./version')) {
+            if ($version.GetAttribute('dir') -eq 'yes') { continue }
+            $numbers = @($version.SelectNodes('./issueNum') | ForEach-Object { $_.InnerText.Trim() } | Where-Object { $_ })
+            $titles = @($numbers | ForEach-Object { if ($issueTitles.ContainsKey($_)) { $issueTitles[$_] } else { '（課題レコード未取得）' } })
+            [pscustomobject][ordered]@{
+                '日時' = if ($localTime) { $localTime.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
+                '履歴番号' = [long]$tx.GetAttribute('id')
+                '送信元ワークスペース' = $tx.GetAttribute('fromStreamName')
+                '送信先ストリーム' = $tx.GetAttribute('streamName')
+                'ファイル名' = $version.GetAttribute('path')
+                'ファイルID' = $version.GetAttribute('eid')
+                'バージョン' = $version.GetAttribute('virtual')
+                '実バージョン' = $version.GetAttribute('real')
+                '課題番号' = $numbers -join ', '
+                '課題タイトル' = $titles -join ' / '
+                'ユーザー' = $tx.GetAttribute('user')
+                'コメント' = if ($commentNode) { $commentNode.InnerText } else { '' }
+            }
+        }
+    }
+    $promoteHeaders = @('日時','履歴番号','送信元ワークスペース','送信先ストリーム','ファイル名','ファイルID','バージョン','実バージョン','課題番号','課題タイトル','ユーザー','コメント')
+    $promoteRows = @($promoteRows | Sort-Object 履歴番号, ファイル名)
+    Save-TabText $promoteRows (Join-Path $OutputDirectory 'ワークスペースからのプロモート履歴.txt') $promoteHeaders
+
     Write-Host "完了: $OutputDirectory"
-    Write-Host "ファイル履歴 $($historyRows.Count) 件 / 課題 $($issueNodes.Count) 件"
+    Write-Host "ファイル履歴 $($historyRows.Count) 件 / 課題 $($issueNodes.Count) 件 / プロモート $($promoteRows.Count) 件"
 }
 finally {
     Pop-Location
